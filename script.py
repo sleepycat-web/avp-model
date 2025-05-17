@@ -325,5 +325,5 @@ def main():
     
     print(f"Processing complete. Processed {count} PDF documents.")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
