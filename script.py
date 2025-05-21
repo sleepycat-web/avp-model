@@ -44,7 +44,7 @@ mongo_collection = "DocumentsMap"  # Hardcoded collection name
 # Configure Gemini API
 gemini_api_key = os.environ.get('GEMINI_API_KEY')
 genai.configure(api_key=gemini_api_key)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 def connect_to_aws():
     """Connect to AWS S3"""
