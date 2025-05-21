@@ -1,3 +1,4 @@
+from http.server import BaseHTTPRequestHandler
 import os
 import json
 import boto3
@@ -5,36 +6,37 @@ import PyPDF2
 import io
 import re
 import nltk
-import spacy
-import google.generativeai as genai
-from http.server import BaseHTTPRequestHandler
-from datetime import datetime
-from pymongo import MongoClient
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from collections import Counter
-from urllib.parse import parse_qs
+import google.generativeai as genai
+from datetime import datetime
+from pymongo import MongoClient
 
-# Download necessary NLTK data (this will run on cold start)
-try:
-    nltk.download('punkt', quiet=True)
-    nltk.download('stopwords', quiet=True)
-except:
-    pass
+# Pre-download NLTK data during build time, not runtime
+# Add this to your build commands or requirements.txt setup
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
 
-# Initialize spaCy (this will run on cold start)
+# For spaCy, include the model in your dependencies
+# Add python-3.9 to your vercel.json runtime and include spacy in requirements.txt
+# Avoid runtime downloads
+import spacy
 try:
     nlp = spacy.load("en_core_web_sm")
 except:
-    # If model isn't installed, download it
-    import subprocess
-    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
-    nlp = spacy.load("en_core_web_sm")
+    # Log error instead of attempting runtime download
+    print("spaCy model not found - ensure it's included in your deployment")
+    nlp = None  # Have a fallback method that doesn't use spaCy
 
 # Configure Gemini API
 gemini_api_key = os.environ.get('GEMINI_API_KEY')
-genai.configure(api_key=gemini_api_key)
-model = genai.GenerativeModel('gemini-2.0-flash')
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
+    model = genai.GenerativeModel('gemini-2.0-flash')
+else:
+    model = None
+    print("Warning: GEMINI_API_KEY not set")
 
 def connect_to_aws():
     """Connect to AWS S3"""
@@ -102,6 +104,9 @@ def extract_keywords_nltk(text, max_keywords=10):
 
 def extract_keywords_spacy(text, max_keywords=10):
     """Extract keywords using spaCy"""
+    if nlp is None:
+        return []  # Fallback if spaCy isn't available
+        
     doc = nlp(text)
     
     # Extract nouns and proper nouns
@@ -139,6 +144,9 @@ def extract_department_from_pdf(text):
 
 def extract_department_gemini(text):
     """Extract department information using Gemini API"""
+    if model is None:
+        return "Unclassified"  # Fallback if Gemini isn't configured
+        
     try:
         prompt = """
         Based on the following document text, identify the government department 
@@ -158,6 +166,9 @@ def extract_department_gemini(text):
 
 def get_categories_gemini(text, keywords):
     """Get document categories using Gemini API in a dynamic way"""
+    if model is None:
+        return ["Unclassified"]  # Fallback if Gemini isn't configured
+        
     try:
         prompt = f"""
         Based on the following document text and extracted keywords, assign 1-3 appropriate
@@ -183,6 +194,9 @@ def get_categories_gemini(text, keywords):
 
 def enhance_keywords_gemini(text, current_keywords):
     """Enhance already extracted keywords with Gemini for better quality"""
+    if model is None:
+        return current_keywords  # Fallback if Gemini isn't configured
+        
     try:
         prompt = f"""
         Based on the following document text and initially extracted keywords, suggest up to 5 additional
@@ -206,6 +220,14 @@ def enhance_keywords_gemini(text, current_keywords):
 
 def extract_fallback_keywords_gemini(text):
     """Emergency fallback using Gemini API if all other keyword extraction methods fail"""
+    if model is None:
+        # Extract some words based on length as a simple fallback
+        words = re.findall(r'\b[a-zA-Z]{5,}\b', text.lower())
+        if words:
+            from collections import Counter
+            return [word for word, _ in Counter(words).most_common(5)]
+        return ["document"]  # Absolute last resort
+        
     try:
         prompt = """
         Extract the 8 most important keywords from the following text. 
@@ -293,31 +315,21 @@ def process_document(s3_client, mongo_collection, bucket, key):
     document_entry["_id"] = str(document_entry.get("_id", ""))  # Convert ObjectId to string for JSON serialization
     return {"status": status, "document": document_entry}
 
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(405)  # Method Not Allowed
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps({"error": "GET method not allowed, use POST"}).encode())
-        return
-        
-    def do_POST(self):
+# Vercel serverless function handler
+def handler(request):
+    # For Vercel, the handler function takes a request object
+    if request.method == "POST":
         try:
-            # Get the content length to read the request body
-            content_length = int(self.headers['Content-Length'])
-            body = self.rfile.read(content_length).decode('utf-8')
-            
-            # Parse JSON body
-            data = json.loads(body)
+            # Parse JSON body from request
+            data = json.loads(request.body)
             bucket = data.get('bucket')
             key = data.get('key')
             
             if not bucket or not key:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Both 'bucket' and 'key' are required"}).encode())
-                return
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "Both 'bucket' and 'key' are required"})
+                }
                 
             # Process document
             s3_client = connect_to_aws()
@@ -326,15 +338,20 @@ class handler(BaseHTTPRequestHandler):
             result = process_document(s3_client, mongo_collection, bucket, key)
             
             # Send response
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
+            return {
+                "statusCode": 200,
+                "body": json.dumps(result)
+            }
             
         except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
-        
-        return
+            import traceback
+            print(traceback.format_exc())  # Log detailed error for debugging
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": str(e)})
+            }
+    else:
+        return {
+            "statusCode": 405,
+            "body": json.dumps({"error": "Method not allowed, use POST"})
+        }
